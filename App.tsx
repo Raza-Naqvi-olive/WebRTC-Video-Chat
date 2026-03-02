@@ -1,19 +1,22 @@
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
   SafeAreaView,
   StyleSheet,
   View,
   Text,
   TouchableOpacity,
+  Platform,
+  PermissionsAndroid,
 } from 'react-native';
 import {
   RTCPeerConnection,
   mediaDevices,
   RTCView,
   MediaStream,
+  RTCSessionDescription,
+  RTCIceCandidate,
 } from 'react-native-webrtc';
 import io from 'socket.io-client';
-import {SERVER_IP} from '@env';
 
 const configuration = {
   iceServers: [
@@ -26,69 +29,110 @@ const configuration = {
 const App = () => {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
-  const [peerConnection, setPeerConnection] =
-    useState<RTCPeerConnection | null>(null);
-  const [socket, setSocket] = useState<any>(null);
+  const peerConnection = useRef<RTCPeerConnection | null>(null);
+  const socket = useRef<any>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Initialize WebSocket connection
-    const newSocket = io(`http://${SERVER_IP}:3000`, {
-      transports: ['websocket'],
-      reconnection: true,
-      reconnectionAttempts: 5,
-      reconnectionDelay: 1000,
-    });
+    // Socket.IO initialization
+    const newSocket = io(
+      Platform.OS === 'ios' ? `http://localhost:3000` : `http://10.0.2.2:3000`,
+      {
+        transports: ['polling', 'websocket'],
+        reconnection: true,
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+      },
+    );
+    console.log('newSocket', newSocket);
+    socket.current = newSocket;
 
-    newSocket.on('connect', () => {
-      console.log('Socket connected successfully');
-      setError(null);
-    });
-
-    newSocket.on('connect_error', error => {
-      console.error('Socket connection error:', error);
-      setError('Failed to connect to server');
-    });
-
-    setSocket(newSocket);
-
-    // Initialize WebRTC
+    // WebRTC peer connection
     const pc = new RTCPeerConnection(configuration);
-    setPeerConnection(pc);
+    peerConnection.current = pc;
 
-    // Set up event listeners
-    (pc as any).onicecandidate = (event: any) => {
+    pc.onicecandidate = event => {
       if (event.candidate) {
-        newSocket.emit('ice-candidate', {
+        socket.current?.emit('ice-candidate', {
           candidate: event.candidate,
           room: 'test-room',
         });
       }
     };
 
-    (pc as any).ontrack = (event: any) => {
-      console.log('Received remote track:', event.streams[0]);
+    pc.ontrack = event => {
       setRemoteStream(event.streams[0]);
     };
 
-    // Cleanup
+    // --- IMPORTANT: Add socket listeners for signaling ---
+    newSocket.on('offer', async data => {
+      if (!peerConnection.current) return;
+      await peerConnection.current.setRemoteDescription(
+        new RTCSessionDescription(data.offer),
+      );
+      const answer = await peerConnection.current.createAnswer();
+      await peerConnection.current.setLocalDescription(answer);
+      newSocket.emit('answer', {answer, room: 'test-room'});
+    });
+
+    newSocket.on('answer', data => {
+      peerConnection.current?.setRemoteDescription(
+        new RTCSessionDescription(data.answer),
+      );
+    });
+
+    newSocket.on('ice-candidate', data => {
+      peerConnection.current?.addIceCandidate(
+        new RTCIceCandidate(data.candidate),
+      );
+    });
+    // --- End of signaling listeners ---
+
+    newSocket.on('connect', () => console.log('Socket connected'));
+    newSocket.on('connect_error', err => {
+      console.error('Socket error:', err);
+      setError('Failed to connect to signaling server');
+    });
+
     return () => {
-      if (pc) {
-        pc.close();
-      }
-      if (newSocket) {
-        newSocket.disconnect();
-      }
+      pc.close();
+      newSocket.disconnect();
     };
   }, []);
 
+  const requestPermissions = async () => {
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.CAMERA,
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+      ]);
+
+      return (
+        granted['android.permission.CAMERA'] ===
+          PermissionsAndroid.RESULTS.GRANTED &&
+        granted['android.permission.RECORD_AUDIO'] ===
+          PermissionsAndroid.RESULTS.GRANTED
+      );
+    }
+    return true;
+  };
+
   const startCall = async () => {
     try {
+      const hasPermission = await requestPermissions();
+      if (!hasPermission) return;
+
+      if (
+        !peerConnection.current ||
+        peerConnection.current.connectionState === 'closed'
+      ) {
+        throw new Error('Peer connection not available');
+      }
+
       setError(null);
       console.log('Starting call...');
 
-      // Get user media
       const stream = await mediaDevices.getUserMedia({
         audio: true,
         video: {
@@ -99,38 +143,27 @@ const App = () => {
         },
       });
 
-      console.log('Got local stream:', stream);
       setLocalStream(stream);
 
-      if (!peerConnection) {
-        throw new Error('PeerConnection not initialized');
-      }
-
-      // Add tracks to peer connection
       stream.getTracks().forEach(track => {
-        peerConnection.addTrack(track, stream);
+        peerConnection.current?.addTrack(track, stream);
       });
 
-      // Create and set local description
-      const offer = await peerConnection.createOffer({
+      const offer = await peerConnection.current.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true,
       });
+      console.log('offer', offer);
+      // await peerConnection.current.setLocalDescription(offer);
+      console.log('peerConnection.current', peerConnection.current);
 
-      await peerConnection.setLocalDescription(offer);
-
-      // Join room and send offer
-      socket?.emit('join-room', 'test-room');
-      socket?.emit('offer', {
-        offer,
-        room: 'test-room',
-      });
+      socket.current?.emit('join-room', 'test-room');
+      socket.current?.emit('offer', {offer, room: 'test-room'});
 
       setIsConnected(true);
     } catch (err) {
       console.error('Error in startCall:', err);
       setError(err instanceof Error ? err.message : 'Failed to start call');
-      setIsConnected(false);
     }
   };
 
